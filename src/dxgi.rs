@@ -67,7 +67,7 @@ unsafe fn capture_screen_inner(monitor_index: usize) -> Result<RgbaImage, String
     read_texture_to_image(&device, &context, &texture, &duplication)
 }
 
-fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
+pub(crate) fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
     unsafe {
         let mut device = None;
         let mut context = None;

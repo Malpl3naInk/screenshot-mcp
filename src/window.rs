@@ -92,15 +92,25 @@ pub struct MonitorInfo {
 
 // ── Window enumeration ────────────────────────────────────────────────
 
+struct EnumWindowsCtx {
+    windows: Vec<WindowInfo>,
+    include_minimized: bool,
+}
+
 pub fn enumerate_windows(include_minimized: bool) -> Vec<WindowInfo> {
-    let mut windows: Vec<WindowInfo> = Vec::new();
+    let mut ctx = EnumWindowsCtx {
+        windows: Vec::new(),
+        include_minimized,
+    };
 
     unsafe {
         EnumWindows(
             Some(enum_windows_callback),
-            &mut windows as *mut _ as LPARAM,
+            &mut ctx as *mut _ as LPARAM,
         );
     }
+
+    let mut windows = ctx.windows;
 
     // Assign z-order (0 = topmost)
     for (i, w) in windows.iter_mut().enumerate() {
@@ -117,10 +127,16 @@ pub fn enumerate_windows(include_minimized: bool) -> Vec<WindowInfo> {
 }
 
 unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> i32 {
-    let windows = &mut *(lparam as *mut Vec<WindowInfo>);
+    let ctx = &mut *(lparam as *mut EnumWindowsCtx);
+    let windows = &mut ctx.windows;
 
     // Skip invisible windows
     if IsWindowVisible(hwnd) == 0 {
+        return 1;
+    }
+
+    // Skip minimized windows unless explicitly requested
+    if !ctx.include_minimized && IsIconic(hwnd) != 0 {
         return 1;
     }
 
@@ -130,6 +146,11 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> i
     // Get window rect
     let mut rect = std::mem::zeroed::<RECT>();
     if GetWindowRect(hwnd, &mut rect) == 0 {
+        return 1;
+    }
+
+    // Skip windows that have been moved far off-screen (minimized/taskbar preview)
+    if rect.left < -20000 || rect.top < -20000 {
         return 1;
     }
 
