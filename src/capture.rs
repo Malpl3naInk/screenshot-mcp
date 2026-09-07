@@ -44,11 +44,29 @@ pub fn take_screenshot(
 // ── Full screen capture (no filter) ───────────────────────────────────
 
 fn capture_full_screen(monitor_index: usize, monitor_rect: &ScreenRect) -> Result<RgbaImage, String> {
-    // Try DXGI Desktop Duplication first (handles HDR correctly)
+    // Try Windows Graphics Capture first. It is more reliable than Desktop
+    // Duplication for HDR displays and some GPU/remote-desktop configurations.
+    match crate::wgc::capture_monitor(monitor_index) {
+        Ok(image) if !is_image_all_black(&image) => {
+            tracing::debug!("WGC monitor capture succeeded");
+            return Ok(image);
+        }
+        Ok(_) => {
+            tracing::warn!("WGC monitor capture returned an all-black frame; falling back to DXGI");
+        }
+        Err(e) => {
+            tracing::warn!("WGC monitor capture failed ({}), falling back to DXGI", e);
+        }
+    }
+
+    // Try DXGI Desktop Duplication next (handles HDR correctly)
     match dxgi::capture_screen(monitor_index) {
-        Ok(image) => {
+        Ok(image) if !is_image_all_black(&image) => {
             tracing::debug!("DXGI capture succeeded");
             return Ok(image);
+        }
+        Ok(_) => {
+            tracing::warn!("DXGI capture returned an all-black frame; falling back to GDI");
         }
         Err(e) => {
             tracing::warn!("DXGI capture failed ({}), falling back to GDI", e);
@@ -56,7 +74,13 @@ fn capture_full_screen(monitor_index: usize, monitor_rect: &ScreenRect) -> Resul
     }
 
     // Fallback: GDI BitBlt
-    capture_full_screen_gdi(monitor_rect)
+    let image = capture_full_screen_gdi(monitor_rect)?;
+    if is_image_all_black(&image) {
+        return Err(
+            "All screen capture backends returned a black frame. Ensure screenshot-mcp runs in the active Windows desktop session (not as a service, scheduled task, remote non-interactive session, or sandboxed host).".into(),
+        );
+    }
+    Ok(image)
 }
 
 fn capture_full_screen_gdi(monitor_rect: &ScreenRect) -> Result<RgbaImage, String> {
@@ -217,6 +241,11 @@ fn capture_with_monitor_fallback(
     // Last resort: GDI fallback on best-detected monitor
     tracing::warn!("All DXGI captures failed/black, falling back to GDI");
     let gdi_img = capture_full_screen_gdi(&monitors[best_monitor].rect)?;
+    if is_image_all_black(&gdi_img) {
+        return Err(
+            "All screen capture backends returned a black frame. Ensure screenshot-mcp runs in the active Windows desktop session (not as a service, scheduled task, remote non-interactive session, or sandboxed host).".into(),
+        );
+    }
     Ok((gdi_img, best_monitor, monitors[best_monitor].rect.clone()))
 }
 
@@ -280,7 +309,8 @@ fn composite_include_mode(
     //
     // 1. Try WGC per-window capture — reads GPU buffer directly,
     //    zero impact on window state (no z-order, no activation)
-    // 2. Fallback: DXGI Desktop Duplication + crop if WGC unavailable
+    // 2. Fall back to PrintWindow/BitBlt for that specific HWND.
+    // 3. Use a monitor capture + crop only as the final fallback.
     //
     // This matches OBS "Game Capture" / "Window Capture" behavior:
     //   - The user never notices the screenshot being taken
@@ -304,7 +334,7 @@ fn composite_include_mode(
     let mut canvas = ImageBuffer::from_pixel(canvas_w, canvas_h, Rgba([0, 0, 0, 255]));
 
     // ── Attempt WGC capture for each matched window ────────────────────
-    let mut need_fallback = Vec::new();
+    let mut need_monitor_fallback = Vec::new();
 
     for win_info in windows {
         let dst_x = win_info.rect.left - bounds.left;
@@ -324,33 +354,48 @@ fn composite_include_mode(
                     );
                 } else {
                     tracing::warn!(
-                        "WGC returned empty for {} ({}), will fallback",
+                        "WGC returned a black frame for {} ({}); trying HWND fallback",
                         win_info.title, win_info.process_name
                     );
-                    need_fallback.push(win_info);
+                    capture_window_fallback(
+                        &mut canvas,
+                        win_info,
+                        dst_x,
+                        dst_y,
+                        &mut need_monitor_fallback,
+                    );
                 }
             }
             Err(e) => {
                 tracing::warn!(
-                    "WGC failed for {} ({}): {}, will fallback to DXGI",
+                    "WGC failed for {} ({}): {}; trying HWND fallback",
                     win_info.title, win_info.process_name, e
                 );
-                need_fallback.push(win_info);
+                capture_window_fallback(
+                    &mut canvas,
+                    win_info,
+                    dst_x,
+                    dst_y,
+                    &mut need_monitor_fallback,
+                );
             }
         }
     }
 
-    // ── Fallback: DXGI for any windows that WGC couldn't handle ────────
-    if !need_fallback.is_empty() {
-        tracing::info!("{} window(s) using DXGI fallback", need_fallback.len());
+    // ── Final fallback: monitor capture + crop ─────────────────────────
+    if !need_monitor_fallback.is_empty() {
+        tracing::info!(
+            "{} window(s) require monitor-capture fallback",
+            need_monitor_fallback.len()
+        );
         
         let (screen, _screen_monitor_index, screen_monitor_rect) =
-            capture_with_monitor_fallback(monitor_index, windows)?;
+            capture_with_monitor_fallback(monitor_index, &need_monitor_fallback)?;
 
         let screen_w = screen.width();
         let screen_h = screen.height();
 
-        for win_info in &need_fallback {
+        for win_info in &need_monitor_fallback {
             let src_x = win_info.rect.left - screen_monitor_rect.left;
             let src_y = win_info.rect.top - screen_monitor_rect.top;
             let win_w = win_info.rect.width() as u32;
@@ -376,7 +421,7 @@ fn composite_include_mode(
                 );
                 overlay_image(&mut canvas, &cropped.to_image(), dst_x, dst_y);
                 tracing::info!(
-                    "DXGI fallback: {} ({}) {}x{} at ({},{})",
+                    "Monitor-capture fallback: {} ({}) {}x{} at ({},{})",
                     win_info.title, win_info.process_name,
                     copy_w, copy_h, dst_x, dst_y
                 );
@@ -385,6 +430,45 @@ fn composite_include_mode(
     }
 
     Ok(canvas)
+}
+
+/// Keep an include-mode capture scoped to its target HWND whenever possible.
+/// `PrintWindow` and window-DC BitBlt can work when WGC is blocked for a
+/// particular application, without exposing unrelated desktop content.
+fn capture_window_fallback(
+    canvas: &mut RgbaImage,
+    win_info: &window::WindowInfo,
+    dst_x: i32,
+    dst_y: i32,
+    need_monitor_fallback: &mut Vec<window::WindowInfo>,
+) {
+    match capture_single_window(win_info) {
+        Ok(image) if !is_image_all_black(&image) => {
+            tracing::info!(
+                "HWND fallback capture OK: {} ({})",
+                win_info.title,
+                win_info.process_name
+            );
+            overlay_image(canvas, &image, dst_x, dst_y);
+        }
+        Ok(_) => {
+            tracing::warn!(
+                "HWND fallback returned a black frame for {} ({})",
+                win_info.title,
+                win_info.process_name
+            );
+            need_monitor_fallback.push(win_info.clone());
+        }
+        Err(e) => {
+            tracing::warn!(
+                "HWND fallback failed for {} ({}): {}",
+                win_info.title,
+                win_info.process_name,
+                e
+            );
+            need_monitor_fallback.push(win_info.clone());
+        }
+    }
 }
 
 // ── Exclude mode: desktop minus excluded windows ─────────────────────────

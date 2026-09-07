@@ -397,36 +397,26 @@ fn do_list_monitors_tool(req: &JsonRpcRequest) -> Value {
 //  Stdio transport I/O
 // ══════════════════════════════════════════════════════════════════════
 
-/// Read one JSON-RPC message from stdin (Content-Length header protocol).
+/// Read one newline-delimited JSON-RPC message from stdin.
+///
+/// MCP's stdio transport uses one complete JSON-RPC message per line.  It is
+/// deliberately not the LSP `Content-Length` framing protocol; treating it as
+/// such makes modern MCP clients wait forever for a response.
 fn read_msg(r: &mut impl BufRead) -> Result<Option<JsonRpcRequest>, String> {
-    let mut content_length: Option<usize> = None;
-
-    loop {
-        let mut line = String::new();
-        if r.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
-            return Ok(None); // EOF
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            break; // End of headers
-        }
-        if let Some(val) = trimmed.strip_prefix("Content-Length:") {
-            content_length = Some(val.trim().parse::<usize>().map_err(|e: std::num::ParseIntError| e.to_string())?);
-        }
+    let mut line = String::new();
+    if r.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+        return Ok(None); // EOF
     }
 
-    let len = content_length.ok_or("Missing Content-Length header")?;
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).map_err(|e| e.to_string())?;
-    let text = String::from_utf8(buf).map_err(|e| e.to_string())?;
-    let req: JsonRpcRequest = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let req: JsonRpcRequest = serde_json::from_str(line.trim_end())
+        .map_err(|e| e.to_string())?;
     Ok(Some(req))
 }
 
 /// Write one JSON-RPC response to stdout.
 fn write_msg(w: &mut impl Write, resp: &Value) -> Result<(), String> {
     let body = serde_json::to_string(resp).map_err(|e| e.to_string())?;
-    write!(w, "Content-Length: {}\r\n\r\n{}", body.len(), body)
+    writeln!(w, "{}", body)
         .map_err(|e| e.to_string())?;
     w.flush().map_err(|e| e.to_string())?;
     Ok(())
